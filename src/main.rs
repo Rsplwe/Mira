@@ -1,34 +1,86 @@
-use bytes::Buf;
-use futures_util::future;
 use futures_util::stream::TryStreamExt;
 use mira::chat::*;
+use mira::msg::Message::*;
+use std::io::{self, Write};
 
 #[tokio::main]
 async fn main() {
-    let stream = connect(14047).await.unwrap();
-    println!("Connected to Bilibili Chat Server");
+    print!("直播间 ID: ");
+    io::stdout().flush().unwrap();
+    let mut id = String::new();
+    io::stdin().read_line(&mut id).unwrap();
+    let id = id.trim_end().parse().unwrap();
+
+    let stream = connect(id).await.unwrap();
     stream
-        .try_for_each(|pk| {
-            match pk.pk_type {
-                TYPE_HEARTBEAT_RESPONSE => {
-                    let mut payload = &pk.payload[..];
-                    println!("Popularity: {}", payload.get_u32());
+        .try_for_each(|pk| async {
+            match pk {
+                ChatPacket::ConnectSuccess => {
+                    println!("成功连接到 Bilibili 弹幕服务器");
                 }
-                TYPE_ANNOUNCEMENT => {
-                    let json: serde_json::Value = serde_json::from_slice(&pk.payload[..]).unwrap();
-                    if json["cmd"] == "DANMU_MSG" {
+                ChatPacket::Popularity(p) => {
+                    println!("[人气值] {}", p);
+                }
+                ChatPacket::Message(msg) => match msg {
+                    Live => println!("[开播]"),
+                    Preparing => println!("[下播]"),
+                    RoomChange {
+                        title,
+                        area_name,
+                        parent_area_name,
+                    } => {
                         println!(
-                            "{}: {}",
-                            json["info"][2][1].as_str().unwrap(),
-                            json["info"][1].as_str().unwrap(),
+                            "[直播间信息更改] [{}·{}] {}",
+                            parent_area_name, area_name, title
                         );
-                    } else {
-                        println!("{}", json);
                     }
-                }
-                _ => (),
+                    Danmaku { uname, text, .. } => {
+                        println!("{}: {}", uname, text);
+                    }
+                    SendGift {
+                        uname,
+                        action,
+                        gift_name,
+                        num,
+                        ..
+                    }
+                    | ComboEnd {
+                        uname,
+                        action,
+                        gift_name,
+                        num,
+                        ..
+                    } => {
+                        println!("{}: {} {} * {}", uname, action, gift_name, num);
+                    }
+                    Welcome {
+                        uname,
+                        is_admin,
+                        is_svip,
+                        ..
+                    } => {
+                        let what = if is_admin {
+                            "房管"
+                        } else if is_svip {
+                            "年费老爷"
+                        } else {
+                            "月费老爷"
+                        };
+                        println!("{} {} 进入直播间", uname, what)
+                    }
+                    WelcomeGuard {
+                        guard_level, uname, ..
+                    } => {
+                        eprintln!("欢迎 {} {} 进入直播间", guard_level, uname);
+                    }
+                    RoomRealTimeMessageUpdate { fans } => {
+                        println!("[粉丝数] {}", fans);
+                    }
+                    HotRoomNotify => println!("[热门直播间]"),
+                    Raw(json) => println!("{}", json.to_string()),
+                },
             }
-            future::ready(Ok(()))
+            Ok(())
         })
         .await
         .unwrap();

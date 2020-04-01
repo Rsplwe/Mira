@@ -1,24 +1,40 @@
 mod http_api {
+    use thiserror::Error;
+
     const API_ROOM_INIT: &str = "http://api.live.bilibili.com/room/v1/Room/room_init?id=";
 
-    pub async fn get_room_id(id: u32) -> Result<u32, Box<dyn std::error::Error>> {
+    pub async fn get_room_id(id: u32) -> Result<u32, Error> {
         let client = hyper::Client::new();
         let uri = format!("{}{}", API_ROOM_INIT, id).parse().unwrap();
-        let resp = client.get(uri).await.unwrap();
+        let resp = client.get(uri).await?;
         let bytes = hyper::body::to_bytes(resp).await?;
-        let json: serde_json::Value = serde_json::from_slice(&bytes)?;
-        Ok(json["data"]["room_id"].as_u64().unwrap() as u32)
+        let str = unsafe { std::str::from_utf8_unchecked(&bytes) };
+        let mut json = json::parse(str).unwrap();
+        if json["code"] != 0 {
+            return Err(Error::Api(json["msg"].take_string().unwrap()));
+        }
+        Ok(json["data"]["room_id"].as_u32().unwrap())
+    }
+
+    #[derive(Error, Debug)]
+    pub enum Error {
+        #[error("HTTP request error")]
+        Http(#[from] hyper::Error),
+        #[error("Bilibili API error: {0}")]
+        Api(String),
     }
 }
 
 pub mod chat {
+    use super::msg::Message;
     use bytes::{Buf, BufMut, BytesMut};
     use futures_util::{
         sink::SinkExt,
         stream::{StreamExt, TryStreamExt},
     };
-    use std::fmt::{self, Write};
+    use std::fmt::Write;
     use std::io::Cursor;
+    use thiserror::Error;
     use tokio::io;
     use tokio::net::TcpStream;
     use tokio::time::{self, Duration};
@@ -31,15 +47,15 @@ pub mod chat {
 
     const HEADER_LENGTH: usize = 16;
 
-    pub const PROTO_RAW_JSON: u16 = 0;
-    pub const PROTO_HEARTBEAT: u16 = 1;
-    pub const PROTO_COMPRESSED_JSON: u16 = 2;
+    const PROTO_HEARTBEAT: u16 = 1;
 
-    pub const TYPE_HEARTBEAT: u32 = 2;
-    pub const TYPE_HEARTBEAT_RESPONSE: u32 = 3;
-    pub const TYPE_ANNOUNCEMENT: u32 = 5;
-    pub const TYPE_AUTHENTICATION: u32 = 7;
-    pub const TYPE_AUTHENTICATION_RESPONSE: u32 = 8;
+    const OP_HEARTBEAT: u32 = 2;
+    const OP_HEARTBEAT_REPLY: u32 = 3;
+    const OP_MESSAGE: u32 = 5;
+    const OP_USER_AUTHENTICATION: u32 = 7;
+    const OP_CONNECT_SUCCESS: u32 = 8;
+
+    const SEQUENCE_ID_DEFAULT: u32 = 1;
 
     pub async fn connect(
         id: u32,
@@ -49,10 +65,10 @@ pub mod chat {
         let stream = TcpStream::connect(addr).await?;
 
         let (mut sink, stream) = Framed::new(stream, ChatCodec).split();
-        sink.send(ChatPacket::authenticate(id)).await?;
+        sink.send(RawChatPacket::authenticate(id)).await?;
         tokio::spawn(async move {
             loop {
-                if let Err(e) = sink.send(ChatPacket::heartbeat()).await {
+                if let Err(e) = sink.send(RawChatPacket::heartbeat()).await {
                     eprintln!("Failed to send heartbeat: {:?}", e);
                 }
                 time::delay_for(HEARTBEAT_DELAY).await;
@@ -61,28 +77,33 @@ pub mod chat {
         Ok(stream)
     }
 
-    #[derive(Debug)]
-    pub struct ChatPacket {
-        pub proto_ver: u16,
-        pub pk_type: u32,
-        pub payload: Vec<u8>,
+    pub enum ChatPacket {
+        ConnectSuccess,
+        Popularity(u32),
+        Message(Message),
     }
 
-    impl ChatPacket {
-        fn authenticate(room_id: u32) -> ChatPacket {
+    struct RawChatPacket {
+        proto_ver: u16,
+        operation: u32,
+        payload: Vec<u8>,
+    }
+
+    impl RawChatPacket {
+        fn authenticate(room_id: u32) -> Self {
             let mut payload = String::new();
             write!(payload, r#"{{"uid":0,"roomid":{}}}"#, room_id).unwrap();
-            ChatPacket {
+            Self {
                 proto_ver: PROTO_HEARTBEAT,
-                pk_type: TYPE_AUTHENTICATION,
+                operation: OP_USER_AUTHENTICATION,
                 payload: payload.into_bytes(),
             }
         }
 
-        fn heartbeat() -> ChatPacket {
-            ChatPacket {
+        fn heartbeat() -> Self {
+            Self {
                 proto_ver: PROTO_HEARTBEAT,
-                pk_type: TYPE_HEARTBEAT,
+                operation: OP_HEARTBEAT,
                 payload: Vec::new(),
             }
         }
@@ -93,20 +114,20 @@ pub mod chat {
     /// packet length: u32
     /// header length: u16 (16)
     /// protocol version: u16
-    /// packet type: u32
-    /// unknown: u32 (1)
+    /// operation: u32
+    /// sequence: u32 (1)
     /// data: [u8]
     struct ChatCodec;
 
-    impl Encoder<ChatPacket> for ChatCodec {
+    impl Encoder<RawChatPacket> for ChatCodec {
         type Error = io::Error;
 
-        fn encode(&mut self, pk: ChatPacket, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        fn encode(&mut self, pk: RawChatPacket, dst: &mut BytesMut) -> Result<(), Self::Error> {
             dst.put_u32((HEADER_LENGTH + pk.payload.len()) as u32);
             dst.put_u16(HEADER_LENGTH as u16);
             dst.put_u16(pk.proto_ver);
-            dst.put_u32(pk.pk_type);
-            dst.put_u32(1);
+            dst.put_u32(pk.operation);
+            dst.put_u32(SEQUENCE_ID_DEFAULT);
             dst.put(&pk.payload[..]);
             Ok(())
         }
@@ -126,50 +147,220 @@ pub mod chat {
                 src.reserve(len - src_len);
                 return Ok(None);
             }
-            src.advance(4);
-            if src.get_u16() != HEADER_LENGTH as u16 {
-                return Err(Error::Codec("unexpected header length"));
-            }
-            let proto_ver = src.get_u16();
-            let pk_type = src.get_u32();
-            src.advance(4); // Unknown field
+            src.advance(8); // packet length + header length + protocol version
+            let operation = src.get_u32();
+            src.advance(4); // Sequence ID
 
             let len = len - HEADER_LENGTH;
-            let mut payload = Vec::with_capacity(len);
-            unsafe {
-                payload.set_len(len);
-            }
-            src.copy_to_slice(&mut payload);
-            Ok(Some(ChatPacket {
-                proto_ver,
-                pk_type,
-                payload,
+            Ok(Some(match operation {
+                OP_CONNECT_SUCCESS => {
+                    let payload = &src[0..len];
+                    if payload != b"{\"code\":0}" {
+                        let str = unsafe { std::str::from_utf8_unchecked(&src[0..len]) };
+                        return Err(Error::ConnectionUnsuccessful(str.to_owned()));
+                    }
+                    src.advance(len);
+                    ChatPacket::ConnectSuccess
+                }
+                OP_HEARTBEAT_REPLY => ChatPacket::Popularity(src.get_u32()),
+                OP_MESSAGE => {
+                    let str = unsafe { std::str::from_utf8_unchecked(&src[0..len]) };
+                    let json = json::parse(&str).unwrap();
+                    let msg = super::msg::Message::parse(json)
+                        .ok_or(Error::UnexpectedMessage(str.to_owned()))?;
+                    src.advance(len);
+                    ChatPacket::Message(msg)
+                }
+                _ => {
+                    src.advance(len);
+                    return Ok(None);
+                }
             }))
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Error, Debug)]
     pub enum Error {
-        /// Codec error with description
-        Codec(&'static str),
-        /// An IO error occured.
-        Io(io::Error),
+        #[error("IO error")]
+        Io(#[from] io::Error),
+        #[error("connection unsuccessful: {0}")]
+        ConnectionUnsuccessful(String),
+        #[error("unexpected message: {0}")]
+        UnexpectedMessage(String),
+    }
+}
+
+pub mod msg {
+
+    use self::Message::*;
+    use std::fmt;
+
+    pub enum Message {
+        Preparing,
+        Live,
+        RoomChange {
+            title: String,
+            area_name: String,
+            parent_area_name: String,
+        },
+        Danmaku {
+            mode: u32,
+            size: u32,
+            color: u32,
+            dmid: i32,
+            text: String,
+            r#type: u32,
+            uid: u32,
+            uname: String,
+        },
+        SendGift {
+            action: String,
+            gift_name: String,
+            num: u32,
+            uid: u32,
+            uname: String,
+        },
+        ComboEnd {
+            action: String,
+            gift_name: String,
+            num: u32,
+            uid: u32,
+            uname: String,
+        },
+        Welcome {
+            /// 房管
+            is_admin: bool,
+            /// 年费 / 月费老爷
+            is_svip: bool,
+            uid: u32,
+            uname: String,
+        },
+        WelcomeGuard {
+            /// 舰队等级
+            guard_level: GuardLevel,
+            uid: u32,
+            uname: String,
+        },
+        RoomRealTimeMessageUpdate {
+            /// 粉丝数
+            fans: u32,
+        },
+        HotRoomNotify,
+        Raw(json::JsonValue),
     }
 
-    impl fmt::Display for Error {
+    impl Message {
+        /// Parses a `ChatPacket` into a `Message`.
+        ///
+        /// If any field of the json is null,
+        /// an `Err` containing string slice of the payload is returned.
+        pub fn parse(mut json: json::JsonValue) -> Option<Message> {
+            Some(match json["cmd"].as_str()? {
+                "PREPARING" => Preparing,
+                "LIVE" => Live,
+                "ROOM_CHANGE" => {
+                    let data = &mut json["data"];
+                    RoomChange {
+                        title: data["title"].take_string()?,
+                        area_name: data["area_name"].take_string()?,
+                        parent_area_name: data["parent_area_name"].take_string()?,
+                    }
+                }
+                "DANMU_MSG" => {
+                    let info = &mut json["info"];
+                    Danmaku {
+                        mode: info[0][1].as_u32()?,
+                        size: info[0][2].as_u32()?,
+                        color: info[0][3].as_u32()?,
+                        dmid: info[0][5].as_i32()?,
+                        text: info[1].take_string()?,
+                        r#type: info[0][9].as_u32()?,
+                        uid: info[2][0].as_u32()?,
+                        uname: info[2][1].take_string()?,
+                    }
+                }
+                "SEND_GIFT" => {
+                    let data = &mut json["data"];
+                    SendGift {
+                        action: data["action"].take_string()?,
+                        gift_name: data["giftName"].take_string()?,
+                        num: data["num"].as_u32()?,
+                        uid: data["uid"].as_u32()?,
+                        uname: data["uname"].take_string()?,
+                    }
+                }
+                "COMBO_END" => {
+                    let data = &mut json["data"];
+                    ComboEnd {
+                        action: data["action"].take_string()?,
+                        gift_name: data["gift_name"].take_string()?,
+                        num: data["combo_num"].as_u32()?,
+                        uid: data["uid"].as_u32()?,
+                        uname: data["uname"].take_string()?,
+                    }
+                }
+                "WELCOME" => {
+                    let data = &mut json["data"];
+                    assert!(data["vip"] == 1);
+                    Welcome {
+                        is_admin: data["is_admin"].as_bool()?,
+                        is_svip: data["svip"] != 0,
+                        uid: data["uid"].as_u32()?,
+                        uname: data["uname"].take_string()?,
+                    }
+                }
+                "WELCOME_GUARD" => {
+                    let data = &mut json["data"];
+                    let guard_level = data["guard_level"].as_u32()?;
+                    WelcomeGuard {
+                        guard_level: GuardLevel::from(guard_level)?,
+                        uid: data["uid"].as_u32()?,
+                        uname: data["username"].take_string()?,
+                    }
+                }
+                "ROOM_REAL_TIME_MESSAGE_UPDATE" => {
+                    let data = &mut json["data"];
+                    RoomRealTimeMessageUpdate {
+                        fans: data["fans"].as_u32()?,
+                    }
+                }
+                "HOT_ROOM_NOTIFY" => HotRoomNotify,
+                _ => Raw(json),
+            })
+        }
+    }
+
+    pub enum GuardLevel {
+        /// 非舰队成员
+        None,
+        /// 舰长
+        Captain,
+        /// 提督
+        Praefect,
+        /// 总督
+        Governor,
+    }
+
+    impl GuardLevel {
+        fn from(n: u32) -> Option<Self> {
+            Some(match n {
+                0 => GuardLevel::None,
+                1 => GuardLevel::Governor,
+                2 => GuardLevel::Praefect,
+                3 => GuardLevel::Captain,
+                _ => return None,
+            })
+        }
+    }
+
+    impl fmt::Display for GuardLevel {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match self {
-                Error::Codec(s) => f.write_str(s),
-                Error::Io(e) => write!(f, "{}", e),
-            }
+            f.write_str(match self {
+                GuardLevel::None => "非舰队成员",
+                GuardLevel::Captain => "舰长",
+                GuardLevel::Praefect => "提督",
+                GuardLevel::Governor => "总督",
+            })
         }
     }
-
-    impl From<io::Error> for Error {
-        fn from(e: io::Error) -> Error {
-            Error::Io(e)
-        }
-    }
-
-    impl std::error::Error for Error {}
 }
