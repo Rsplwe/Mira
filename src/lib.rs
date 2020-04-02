@@ -1,5 +1,5 @@
 mod http_api {
-    use thiserror::Error;
+    use anyhow::{anyhow, Error};
 
     const API_ROOM_INIT: &str = "http://api.live.bilibili.com/room/v1/Room/room_init?id=";
 
@@ -9,39 +9,33 @@ mod http_api {
         let resp = client.get(uri).await?;
         let bytes = hyper::body::to_bytes(resp).await?;
         let str = unsafe { std::str::from_utf8_unchecked(&bytes) };
-        let mut json = json::parse(str).unwrap();
+        let json = json::parse(str).unwrap();
         if json["code"] != 0 {
-            return Err(Error::Api(json["msg"].take_string().unwrap()));
+            return Err(anyhow!(
+                "Bilibili API error: {}",
+                json["msg"].as_str().unwrap()
+            ));
         }
         Ok(json["data"]["room_id"].as_u32().unwrap())
-    }
-
-    #[derive(Error, Debug)]
-    pub enum Error {
-        #[error("HTTP request error")]
-        Http(#[from] hyper::Error),
-        #[error("Bilibili API error: {0}")]
-        Api(String),
     }
 }
 
 pub mod chat {
     use super::msg::Message;
+    use anyhow::{anyhow, Error};
     use bytes::{Buf, BufMut, BytesMut};
-    use futures_util::{
-        sink::SinkExt,
-        stream::{StreamExt, TryStreamExt},
-    };
+    use futures_sink::Sink;
+    use futures_util::future;
+    use futures_util::{sink::SinkExt, stream::StreamExt};
     use std::fmt::Write;
+    use std::future::Future;
     use std::io::Cursor;
-    use thiserror::Error;
     use tokio::io;
     use tokio::net::TcpStream;
     use tokio::time::{self, Duration};
-    use tokio_util::codec::{Decoder, Encoder, Framed};
+    use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 
-    const HOST: &str = "broadcastlv.chat.bilibili.com";
-    const PORT: u16 = 2243;
+    const ADDR: (&str, u16) = ("broadcastlv.chat.bilibili.com", 2243);
 
     const HEARTBEAT_DELAY: Duration = Duration::from_secs(30);
 
@@ -57,24 +51,47 @@ pub mod chat {
 
     const SEQUENCE_ID_DEFAULT: u32 = 1;
 
-    pub async fn connect(
-        id: u32,
-    ) -> Result<impl TryStreamExt<Ok = ChatPacket, Error = Error>, Box<dyn std::error::Error>> {
+    pub async fn connect<F, Fut>(id: u32, handle_packet: F) -> Result<(), Error>
+    where
+        F: FnMut(ChatPacket) -> Fut,
+        Fut: Future<Output = ()>,
+    {
         let id = super::http_api::get_room_id(id).await?;
-        let addr = (HOST, PORT);
-        let stream = TcpStream::connect(addr).await?;
+        let mut stream = TcpStream::connect(ADDR).await?;
+        let (r, w) = TcpStream::split(&mut stream);
+        let r = FramedRead::new(r, ChatCodec);
+        let mut w = FramedWrite::new(w, ChatCodec);
 
-        let (mut sink, stream) = Framed::new(stream, ChatCodec).split();
-        sink.send(RawChatPacket::authenticate(id)).await?;
-        tokio::spawn(async move {
-            loop {
-                if let Err(e) = sink.send(RawChatPacket::heartbeat()).await {
-                    eprintln!("Failed to send heartbeat: {:?}", e);
-                }
-                time::delay_for(HEARTBEAT_DELAY).await;
+        w.send(RawChatPacket::authenticate(id)).await?;
+        future::try_join(handle_stream(r, handle_packet), send_heartbeat(w)).await?;
+
+        Ok(())
+    }
+
+    async fn handle_stream<F, Fut>(
+        mut stream: impl StreamExt<Item = Result<ChatPacket, Error>> + Unpin,
+        mut handle_packet: F,
+    ) -> Result<(), Error>
+    where
+        F: FnMut(ChatPacket) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        loop {
+            match stream.next().await {
+                Some(res) => handle_packet(res?).await,
+                None => break,
             }
-        });
-        Ok(stream)
+        }
+        Ok(())
+    }
+
+    async fn send_heartbeat(
+        mut sink: impl Sink<RawChatPacket, Error = io::Error> + Unpin,
+    ) -> Result<(), Error> {
+        loop {
+            sink.send(RawChatPacket::heartbeat()).await?;
+            time::delay_for(HEARTBEAT_DELAY).await;
+        }
     }
 
     pub enum ChatPacket {
@@ -123,7 +140,9 @@ pub mod chat {
         type Error = io::Error;
 
         fn encode(&mut self, pk: RawChatPacket, dst: &mut BytesMut) -> Result<(), Self::Error> {
-            dst.put_u32((HEADER_LENGTH + pk.payload.len()) as u32);
+            let len = HEADER_LENGTH + pk.payload.len();
+            dst.reserve(len);
+            dst.put_u32(len as u32);
             dst.put_u16(HEADER_LENGTH as u16);
             dst.put_u16(pk.proto_ver);
             dst.put_u32(pk.operation);
@@ -144,7 +163,8 @@ pub mod chat {
             }
             let len = Cursor::new(&src).get_u32() as usize;
             if src_len < len {
-                src.reserve(len - src_len);
+                // Reserved bytes counts from the cursor index
+                src.reserve(len);
                 return Ok(None);
             }
             src.advance(8); // packet length + header length + protocol version
@@ -157,7 +177,7 @@ pub mod chat {
                     let payload = &src[0..len];
                     if payload != b"{\"code\":0}" {
                         let str = unsafe { std::str::from_utf8_unchecked(&src[0..len]) };
-                        return Err(Error::ConnectionUnsuccessful(str.to_owned()));
+                        return Err(anyhow!("connection failed: {}", str));
                     }
                     src.advance(len);
                     ChatPacket::ConnectSuccess
@@ -167,26 +187,17 @@ pub mod chat {
                     let str = unsafe { std::str::from_utf8_unchecked(&src[0..len]) };
                     let json = json::parse(&str).unwrap();
                     let msg = super::msg::Message::parse(json)
-                        .ok_or(Error::UnexpectedMessage(str.to_owned()))?;
+                        .unwrap_or_else(|| Message::ParsingError(str.to_owned()));
                     src.advance(len);
                     ChatPacket::Message(msg)
                 }
                 _ => {
+                    // Unexpected opreation, skip this packet
                     src.advance(len);
                     return Ok(None);
                 }
             }))
         }
-    }
-
-    #[derive(Error, Debug)]
-    pub enum Error {
-        #[error("IO error")]
-        Io(#[from] io::Error),
-        #[error("connection unsuccessful: {0}")]
-        ConnectionUnsuccessful(String),
-        #[error("unexpected message: {0}")]
-        UnexpectedMessage(String),
     }
 }
 
@@ -247,6 +258,7 @@ pub mod msg {
         },
         HotRoomNotify,
         Raw(json::JsonValue),
+        ParsingError(String),
     }
 
     impl Message {

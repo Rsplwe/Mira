@@ -13,7 +13,7 @@ futures-sink = "0.3"
 futures-util = { version = "0.3", features = ["sink"] }
 bytes = "0.5"
 json = "0.12"
-thiserror = "1.0"
+anyhow = "1.0"
 
 [profile.release]
 lto = true
