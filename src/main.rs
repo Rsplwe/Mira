@@ -82,7 +82,7 @@ async fn handle_packet(pk: ChatPacket) {
             }
             HotRoomNotify => println!("[热门直播间]"),
             Raw(json) => println!("{}", json.to_string()),
-            ParsingError(str) => panic!(str),
+            ParsingError(str) => panic!("failed to parse json: {}", str),
         },
     }
 }

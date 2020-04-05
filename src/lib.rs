@@ -22,16 +22,16 @@ mod http_api {
 
 pub mod chat {
     use super::msg::Message;
-    use anyhow::{anyhow, Error};
+    use anyhow::Error;
     use bytes::{Buf, BufMut, BytesMut};
     use futures_sink::Sink;
-    use futures_util::future;
     use futures_util::{sink::SinkExt, stream::StreamExt};
     use std::fmt::Write;
     use std::future::Future;
     use std::io::Cursor;
     use tokio::io;
     use tokio::net::TcpStream;
+    use tokio::stream::Stream;
     use tokio::time::{self, Duration};
     use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 
@@ -60,16 +60,15 @@ pub mod chat {
         let mut stream = TcpStream::connect(ADDR).await?;
         let (r, w) = TcpStream::split(&mut stream);
         let r = FramedRead::new(r, ChatCodec);
-        let mut w = FramedWrite::new(w, ChatCodec);
+        let w = FramedWrite::new(w, ChatCodec);
 
-        w.send(RawChatPacket::authenticate(id)).await?;
-        future::try_join(handle_stream(r, handle_packet), send_heartbeat(w)).await?;
+        tokio::try_join!(handle_stream(r, handle_packet), handle_sink(w, id))?;
 
         Ok(())
     }
 
     async fn handle_stream<F, Fut>(
-        mut stream: impl StreamExt<Item = Result<ChatPacket, Error>> + Unpin,
+        mut stream: impl Stream<Item = Result<ChatPacket, Error>> + Unpin,
         mut handle_packet: F,
     ) -> Result<(), Error>
     where
@@ -85,9 +84,11 @@ pub mod chat {
         Ok(())
     }
 
-    async fn send_heartbeat(
+    async fn handle_sink(
         mut sink: impl Sink<RawChatPacket, Error = io::Error> + Unpin,
+        id: u32,
     ) -> Result<(), Error> {
+        sink.send(RawChatPacket::authenticate(id)).await?;
         loop {
             sink.send(RawChatPacket::heartbeat()).await?;
             time::delay_for(HEARTBEAT_DELAY).await;
@@ -109,7 +110,7 @@ pub mod chat {
     impl RawChatPacket {
         fn authenticate(room_id: u32) -> Self {
             let mut payload = String::new();
-            write!(payload, r#"{{"uid":0,"roomid":{}}}"#, room_id).unwrap();
+            write!(payload, r#"{{"roomid":{}}}"#, room_id).unwrap();
             Self {
                 proto_ver: PROTO_HEARTBEAT,
                 operation: OP_USER_AUTHENTICATION,
@@ -117,12 +118,14 @@ pub mod chat {
             }
         }
 
+        const HEARTBEAT: Self = Self {
+            proto_ver: PROTO_HEARTBEAT,
+            operation: OP_HEARTBEAT,
+            payload: Vec::new(),
+        };
+
         fn heartbeat() -> Self {
-            Self {
-                proto_ver: PROTO_HEARTBEAT,
-                operation: OP_HEARTBEAT,
-                payload: Vec::new(),
-            }
+            Self::HEARTBEAT
         }
     }
 
@@ -163,7 +166,7 @@ pub mod chat {
             }
             let len = Cursor::new(&src).get_u32() as usize;
             if src_len < len {
-                // Reserved bytes counts from the cursor index
+                // Reserved bytes counts from the current index
                 src.reserve(len);
                 return Ok(None);
             }
@@ -174,25 +177,20 @@ pub mod chat {
             let len = len - HEADER_LENGTH;
             Ok(Some(match operation {
                 OP_CONNECT_SUCCESS => {
-                    let payload = &src[0..len];
-                    if payload != b"{\"code\":0}" {
-                        let str = unsafe { std::str::from_utf8_unchecked(&src[0..len]) };
-                        return Err(anyhow!("connection failed: {}", str));
-                    }
                     src.advance(len);
                     ChatPacket::ConnectSuccess
                 }
                 OP_HEARTBEAT_REPLY => ChatPacket::Popularity(src.get_u32()),
                 OP_MESSAGE => {
                     let str = unsafe { std::str::from_utf8_unchecked(&src[0..len]) };
-                    let json = json::parse(&str).unwrap();
-                    let msg = super::msg::Message::parse(json)
+                    let json = json::parse(str).unwrap();
+                    let msg = Message::parse(json)
                         .unwrap_or_else(|| Message::ParsingError(str.to_owned()));
                     src.advance(len);
                     ChatPacket::Message(msg)
                 }
                 _ => {
-                    // Unexpected opreation, skip this packet
+                    // Unexpected operation, skip this packet
                     src.advance(len);
                     return Ok(None);
                 }
@@ -262,10 +260,9 @@ pub mod msg {
     }
 
     impl Message {
-        /// Parses a `ChatPacket` into a `Message`.
+        /// Parses a `JsonValue` into a `Message`.
         ///
-        /// If any field of the json is null,
-        /// an `Err` containing string slice of the payload is returned.
+        /// If any required field of the json is null, `None` is returned.
         pub fn parse(mut json: json::JsonValue) -> Option<Message> {
             Some(match json["cmd"].as_str()? {
                 "PREPARING" => Preparing,
