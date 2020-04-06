@@ -52,9 +52,9 @@ pub mod chat {
     const SEQUENCE_ID_DEFAULT: u32 = 1;
 
     pub async fn connect<F, Fut>(id: u32, handle_packet: F) -> Result<(), Error>
-    where
-        F: FnMut(ChatPacket) -> Fut,
-        Fut: Future<Output = ()>,
+        where
+            F: FnMut(ChatPacket) -> Fut,
+            Fut: Future<Output=()>,
     {
         let id = super::http_api::get_room_id(id).await?;
         let mut stream = TcpStream::connect(ADDR).await?;
@@ -68,12 +68,12 @@ pub mod chat {
     }
 
     async fn handle_stream<F, Fut>(
-        mut stream: impl Stream<Item = Result<ChatPacket, Error>> + Unpin,
+        mut stream: impl Stream<Item=Result<ChatPacket, Error>> + Unpin,
         mut handle_packet: F,
     ) -> Result<(), Error>
-    where
-        F: FnMut(ChatPacket) -> Fut,
-        Fut: Future<Output = ()>,
+        where
+            F: FnMut(ChatPacket) -> Fut,
+            Fut: Future<Output=()>,
     {
         loop {
             match stream.next().await {
@@ -85,7 +85,7 @@ pub mod chat {
     }
 
     async fn handle_sink(
-        mut sink: impl Sink<RawChatPacket, Error = io::Error> + Unpin,
+        mut sink: impl Sink<RawChatPacket, Error=io::Error> + Unpin,
         id: u32,
     ) -> Result<(), Error> {
         sink.send(RawChatPacket::authenticate(id)).await?;
@@ -200,7 +200,6 @@ pub mod chat {
 }
 
 pub mod msg {
-
     use self::Message::*;
     use std::fmt;
 
@@ -253,6 +252,49 @@ pub mod msg {
         RoomRealTimeMessageUpdate {
             /// 粉丝数
             fans: u32,
+        },
+        RoomRank {
+            /// 房间排行榜
+            rank_desc: String,
+            color: String,
+            timestamp: u32,
+        },
+        EntryEffect {
+            /// 进入房间效果(舰长、提督、总督)
+            id: u32,
+            uid: u32,
+            target_id: u32,
+            face: String,
+            copy_writing: String,
+            copy_color: String,
+        },
+        NoticeMessage {
+            /// 通知消息
+            roomid: u32,
+            real_roomid: u32,
+            msg_common: String,
+            msg_self: String,
+        },
+        SuperChatMessage {
+            /// 类似于(就是) Youtube 的 SC
+            id: String,
+            sender_uid: u32,
+            // 打赏金额
+            price: u32,
+            message: String,
+            sender_name: String,
+        },
+        SuperChatMessageJapanese {
+            /// 直播对象为vtuber时会可以选择翻译为日文显示，货币单位并不会转换
+            id: String,
+            sender_uid: String,
+            // 打赏金额
+            price: u32,
+            // 原文
+            message: String,
+            // 翻译之后的日文
+            message_jpn: String,
+            sender_name: String,
         },
         HotRoomNotify,
         Raw(json::JsonValue),
@@ -327,10 +369,59 @@ pub mod msg {
                         uname: data["username"].take_string()?,
                     }
                 }
+                "ROOM_RANK" => {
+                    let data = &mut json["data"];
+                    RoomRank {
+                        rank_desc: data["rank_desc"].take_string()?,
+                        color: data["color"].take_string()?,
+                        timestamp: data["timestamp"].as_u32()?,
+                    }
+                }
+                "ENTRY_EFFECT" => {
+                    let data = &mut json["data"];
+                    EntryEffect {
+                        id: data["id"].as_u32()?,
+                        uid: data["uid"].as_u32()?,
+                        target_id: data["target_id"].as_u32()?,
+                        face: data["face"].take_string()?,
+                        copy_writing: data["copy_writing"].take_string()?,
+                        copy_color: data["copy_color"].take_string()?,
+                    }
+                }
+                "NOTICE_MSG" => {
+                    NoticeMessage {
+                        roomid: json["roomid"].as_u32()?,
+                        real_roomid: json["real_roomid"].as_u32()?,
+                        msg_common: json["msg_common"].take_string()?,
+                        msg_self: json["msg_self"].take_string()?,
+                    }
+                }
                 "ROOM_REAL_TIME_MESSAGE_UPDATE" => {
                     let data = &mut json["data"];
                     RoomRealTimeMessageUpdate {
                         fans: data["fans"].as_u32()?,
+                    }
+                }
+                "SUPER_CHAT_MESSAGE" => {
+                    let data = &mut json["data"];
+                    SuperChatMessage {
+                        id: data["id"].take_string()?,
+                        sender_uid: data["uid"].as_u32()?,
+                        // 打赏金额
+                        price: data["price"].as_u32()?,
+                        message: data["message"].take_string()?,
+                        sender_name: data["user_info"]["uname"].take_string()?,
+                    }
+                }
+                "SUPER_CHAT_MESSAGE_JPN" => {
+                    let data = &mut json["data"];
+                    SuperChatMessageJapanese {
+                        id: data["id"].take_string()?,
+                        sender_uid: data["uid"].take_string()?,
+                        price: data["price"].as_u32()?,
+                        message: data["message"].take_string()?,
+                        message_jpn: data["message_jpn"].take_string()?,
+                        sender_name: data["user_info"]["uname"].take_string()?,
                     }
                 }
                 "HOT_ROOM_NOTIFY" => HotRoomNotify,
