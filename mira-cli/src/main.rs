@@ -1,5 +1,5 @@
-use mira::chat::*;
-use mira::msg::Message::*;
+use mira_core::chat::*;
+use mira_core::msg::Message::*;
 use std::io::{self, Write};
 
 #[tokio::main]
