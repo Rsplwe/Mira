@@ -2,6 +2,7 @@
 
 members = [
     "mira-core",
+    "mira-scene",
     "mira-cli"
 ]
 
