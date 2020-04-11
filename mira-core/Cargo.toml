@@ -5,7 +5,8 @@ authors = ["Rsplwe <i@rsplwe.com>", "Scallop Ye <yescallop@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-hyper = "0.13"
+hyper = "0.13.4"
+hyper-tls = "0.4.1"
 tokio = { version = "0.2", features = ["tcp", "dns", "stream", "time", "io-util"] }
 tokio-util = { version = "0.3", features = ["codec"] }
 futures-sink = "0.3"

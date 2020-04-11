@@ -1,11 +1,17 @@
 mod http_api {
     use anyhow::{bail, Error};
+    use hyper::{Client, Body};
+    use hyper_tls::HttpsConnector;
+    use hyper::client::HttpConnector;
+    use hyper::client::connect::dns::GaiResolver;
 
-    const API_ROOM_INIT: &str = "http://api.live.bilibili.com/room/v1/Room/room_init?id=";
-    const API_ROOM_CONF: &str = "http://api.live.bilibili.com/room/v1/Danmu/getConf?room_id=";
+    const API_ROOM_INIT: &str = "https://api.live.bilibili.com/room/v1/Room/room_init?id=";
+    const API_ROOM_CONF: &str = "https://api.live.bilibili.com/room/v1/Danmu/getConf?room_id=";
 
-    pub async fn get_room_id(id: u32) -> Result<u32, Error> {
-        let client = hyper::Client::new();
+    pub async fn get_room_id(
+        client: &mut Client<HttpsConnector<HttpConnector<GaiResolver>>, Body>,
+        id: u32,
+    ) -> Result<u32, Error> {
         let uri = format!("{}{}", API_ROOM_INIT, id).parse().unwrap();
         let resp = client.get(uri).await?;
         let bytes = hyper::body::to_bytes(resp).await?;
@@ -17,8 +23,10 @@ mod http_api {
         Ok(json["data"]["room_id"].as_u32().unwrap())
     }
 
-    pub async fn get_room_token(id: u32) -> Result<String, Error> {
-        let client = hyper::Client::new();
+    pub async fn get_room_token(
+        client: &mut Client<HttpsConnector<HttpConnector<GaiResolver>>, Body>,
+        id: u32,
+    ) -> Result<String, Error> {
         let uri = format!("{}{}", API_ROOM_CONF, id).parse().unwrap();
         let resp = client.get(uri).await?;
         let bytes = hyper::body::to_bytes(resp).await?;
@@ -37,6 +45,8 @@ pub mod chat {
     use bytes::{Buf, BufMut, BytesMut};
     use futures_sink::Sink;
     use futures_util::{sink::SinkExt, stream::StreamExt};
+    use hyper::Client;
+    use hyper_tls::HttpsConnector;
     use miniz_oxide::inflate::decompress_to_vec_zlib as decompress;
     use std::future::Future;
     use tokio::io;
@@ -44,6 +54,7 @@ pub mod chat {
     use tokio::stream::Stream;
     use tokio::time::{self, Duration};
     use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
+
 
     const ADDR: (&str, u16) = ("broadcastlv.chat.bilibili.com", 2243);
 
@@ -64,8 +75,11 @@ pub mod chat {
             F: FnMut(ChatPacket) -> Fut,
             Fut: Future<Output=()>,
     {
-        let id = super::http_api::get_room_id(id).await?;
-        let token = super::http_api::get_room_token(id).await?;
+        let https_connector = HttpsConnector::new();
+        let mut request_client = Client::builder().build::<_, hyper::Body>(https_connector);
+
+        let id = super::http_api::get_room_id(&mut request_client, id).await?;
+        let token = super::http_api::get_room_token(&mut request_client, id).await?;
         let mut stream = TcpStream::connect(ADDR).await?;
         let (r, w) = TcpStream::split(&mut stream);
         let r = FramedRead::new(r, ChatCodec);
