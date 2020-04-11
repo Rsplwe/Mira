@@ -2,6 +2,7 @@ mod http_api {
     use anyhow::{bail, Error};
 
     const API_ROOM_INIT: &str = "http://api.live.bilibili.com/room/v1/Room/room_init?id=";
+    const API_ROOM_CONF: &str = "http://api.live.bilibili.com/room/v1/Danmu/getConf?room_id=";
 
     pub async fn get_room_id(id: u32) -> Result<u32, Error> {
         let client = hyper::Client::new();
@@ -14,6 +15,19 @@ mod http_api {
             bail!("Bilibili API error: {}", json["msg"].as_str().unwrap());
         }
         Ok(json["data"]["room_id"].as_u32().unwrap())
+    }
+
+    pub async fn get_room_token(id: u32) -> Result<String, Error> {
+        let client = hyper::Client::new();
+        let uri = format!("{}{}", API_ROOM_CONF, id).parse().unwrap();
+        let resp = client.get(uri).await?;
+        let bytes = hyper::body::to_bytes(resp).await?;
+        let str = unsafe { std::str::from_utf8_unchecked(&bytes) };
+        let json = json::parse(str).unwrap();
+        if json["code"] != 0 {
+            bail!("Bilibili API error: {}", json["msg"].as_str().unwrap());
+        }
+        Ok(json["data"]["token"].to_string())
     }
 }
 
@@ -46,28 +60,29 @@ pub mod chat {
     const SEQUENCE_ID_DEFAULT: u32 = 1;
 
     pub async fn connect<F, Fut>(id: u32, handle_packet: F) -> Result<(), Error>
-    where
-        F: FnMut(ChatPacket) -> Fut,
-        Fut: Future<Output = ()>,
+        where
+            F: FnMut(ChatPacket) -> Fut,
+            Fut: Future<Output=()>,
     {
         let id = super::http_api::get_room_id(id).await?;
+        let token = super::http_api::get_room_token(id).await?;
         let mut stream = TcpStream::connect(ADDR).await?;
         let (r, w) = TcpStream::split(&mut stream);
         let r = FramedRead::new(r, ChatCodec);
         let w = FramedWrite::new(w, ChatCodec);
 
-        tokio::try_join!(handle_stream(r, handle_packet), handle_sink(w, id))?;
+        tokio::try_join!(handle_stream(r, handle_packet), handle_sink(w, id, token))?;
 
         Ok(())
     }
 
     async fn handle_stream<F, Fut>(
-        mut stream: impl Stream<Item = Result<Vec<ChatPacket>, Error>> + Unpin,
+        mut stream: impl Stream<Item=Result<Vec<ChatPacket>, Error>> + Unpin,
         mut handle_packet: F,
     ) -> Result<(), Error>
-    where
-        F: FnMut(ChatPacket) -> Fut,
-        Fut: Future<Output = ()>,
+        where
+            F: FnMut(ChatPacket) -> Fut,
+            Fut: Future<Output=()>,
     {
         loop {
             match stream.next().await {
@@ -83,10 +98,11 @@ pub mod chat {
     }
 
     async fn handle_sink(
-        mut sink: impl Sink<RawChatPacket, Error = io::Error> + Unpin,
+        mut sink: impl Sink<RawChatPacket, Error=io::Error> + Unpin,
         id: u32,
+        token: String,
     ) -> Result<(), Error> {
-        sink.send(RawChatPacket::authenticate(id)).await?;
+        sink.send(RawChatPacket::authenticate(id, token)).await?;
         loop {
             sink.send(RawChatPacket::heartbeat()).await?;
             time::delay_for(HEARTBEAT_DELAY).await;
@@ -106,11 +122,11 @@ pub mod chat {
     }
 
     impl RawChatPacket {
-        fn authenticate(room_id: u32) -> Self {
+        fn authenticate(room_id: u32, token: String) -> Self {
             Self {
                 proto_ver: 1,
                 operation: OP_USER_AUTHENTICATION,
-                payload: format!(r#"{{"roomid":{},"protover":2}}"#, room_id).into_bytes(),
+                payload: format!(r#"{{"roomid":{},"protover":2,"token":"{}","uid":0}}"#, room_id, token).into_bytes(),
             }
         }
 
