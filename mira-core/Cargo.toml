@@ -6,10 +6,11 @@ edition = "2018"
 
 [dependencies]
 hyper = "0.13"
-tokio = { version = "0.2", features = ["macros", "tcp", "dns", "stream", "time", "io-util"] }
+tokio = { version = "0.2", features = ["tcp", "dns", "stream", "time", "io-util"] }
 tokio-util = { version = "0.3", features = ["codec"] }
 futures-sink = "0.3"
 futures-util = { version = "0.3", features = ["sink"] }
 bytes = "0.5"
 json = "0.12"
 anyhow = "1.0"
+miniz_oxide = "0.3"

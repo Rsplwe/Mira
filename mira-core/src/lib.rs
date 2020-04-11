@@ -1,5 +1,5 @@
 mod http_api {
-    use anyhow::{anyhow, Error};
+    use anyhow::{bail, Error};
 
     const API_ROOM_INIT: &str = "http://api.live.bilibili.com/room/v1/Room/room_init?id=";
 
@@ -11,10 +11,7 @@ mod http_api {
         let str = unsafe { std::str::from_utf8_unchecked(&bytes) };
         let json = json::parse(str).unwrap();
         if json["code"] != 0 {
-            return Err(anyhow!(
-                "Bilibili API error: {}",
-                json["msg"].as_str().unwrap()
-            ));
+            bail!("Bilibili API error: {}", json["msg"].as_str().unwrap());
         }
         Ok(json["data"]["room_id"].as_u32().unwrap())
     }
@@ -22,13 +19,12 @@ mod http_api {
 
 pub mod chat {
     use super::msg::Message;
-    use anyhow::Error;
+    use anyhow::{bail, Error};
     use bytes::{Buf, BufMut, BytesMut};
     use futures_sink::Sink;
     use futures_util::{sink::SinkExt, stream::StreamExt};
-    use std::fmt::Write;
+    use miniz_oxide::inflate::decompress_to_vec_zlib as decompress;
     use std::future::Future;
-    use std::io::Cursor;
     use tokio::io;
     use tokio::net::TcpStream;
     use tokio::stream::Stream;
@@ -41,8 +37,6 @@ pub mod chat {
 
     const HEADER_LENGTH: usize = 16;
 
-    const PROTO_HEARTBEAT: u16 = 1;
-
     const OP_HEARTBEAT: u32 = 2;
     const OP_HEARTBEAT_REPLY: u32 = 3;
     const OP_MESSAGE: u32 = 5;
@@ -52,9 +46,9 @@ pub mod chat {
     const SEQUENCE_ID_DEFAULT: u32 = 1;
 
     pub async fn connect<F, Fut>(id: u32, handle_packet: F) -> Result<(), Error>
-        where
-            F: FnMut(ChatPacket) -> Fut,
-            Fut: Future<Output=()>,
+    where
+        F: FnMut(ChatPacket) -> Fut,
+        Fut: Future<Output = ()>,
     {
         let id = super::http_api::get_room_id(id).await?;
         let mut stream = TcpStream::connect(ADDR).await?;
@@ -68,16 +62,20 @@ pub mod chat {
     }
 
     async fn handle_stream<F, Fut>(
-        mut stream: impl Stream<Item=Result<ChatPacket, Error>> + Unpin,
+        mut stream: impl Stream<Item = Result<Vec<ChatPacket>, Error>> + Unpin,
         mut handle_packet: F,
     ) -> Result<(), Error>
-        where
-            F: FnMut(ChatPacket) -> Fut,
-            Fut: Future<Output=()>,
+    where
+        F: FnMut(ChatPacket) -> Fut,
+        Fut: Future<Output = ()>,
     {
         loop {
             match stream.next().await {
-                Some(res) => handle_packet(res?).await,
+                Some(res) => {
+                    for pk in res? {
+                        handle_packet(pk).await;
+                    }
+                }
                 None => break,
             }
         }
@@ -85,7 +83,7 @@ pub mod chat {
     }
 
     async fn handle_sink(
-        mut sink: impl Sink<RawChatPacket, Error=io::Error> + Unpin,
+        mut sink: impl Sink<RawChatPacket, Error = io::Error> + Unpin,
         id: u32,
     ) -> Result<(), Error> {
         sink.send(RawChatPacket::authenticate(id)).await?;
@@ -109,17 +107,15 @@ pub mod chat {
 
     impl RawChatPacket {
         fn authenticate(room_id: u32) -> Self {
-            let mut payload = String::new();
-            write!(payload, r#"{{"roomid":{}}}"#, room_id).unwrap();
             Self {
-                proto_ver: PROTO_HEARTBEAT,
+                proto_ver: 1,
                 operation: OP_USER_AUTHENTICATION,
-                payload: payload.into_bytes(),
+                payload: format!(r#"{{"roomid":{},"protover":2}}"#, room_id).into_bytes(),
             }
         }
 
         const HEARTBEAT: Self = Self {
-            proto_ver: PROTO_HEARTBEAT,
+            proto_ver: 1,
             operation: OP_HEARTBEAT,
             payload: Vec::new(),
         };
@@ -156,7 +152,7 @@ pub mod chat {
     }
 
     impl Decoder for ChatCodec {
-        type Item = ChatPacket;
+        type Item = Vec<ChatPacket>;
         type Error = Error;
 
         fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
@@ -164,37 +160,50 @@ pub mod chat {
             if src_len < 4 {
                 return Ok(None);
             }
-            let len = Cursor::new(&src).get_u32() as usize;
+            let mut cur = src.as_ref();
+            let len = cur.get_u32() as usize;
             if src_len < len {
                 // Reserved bytes counts from the current index
                 src.reserve(len);
                 return Ok(None);
             }
-            src.advance(8); // packet length + header length + protocol version
-            let operation = src.get_u32();
-            src.advance(4); // Sequence ID
+            cur.advance(2); // header length
+            let proto_ver = cur.get_u16();
+            let operation = cur.get_u32();
+            cur.advance(4); // Sequence ID
 
-            let len = len - HEADER_LENGTH;
-            Ok(Some(match operation {
-                OP_CONNECT_SUCCESS => {
-                    src.advance(len);
-                    ChatPacket::ConnectSuccess
-                }
-                OP_HEARTBEAT_REPLY => ChatPacket::Popularity(src.get_u32()),
+            let mut res = Vec::new();
+            match operation {
+                OP_CONNECT_SUCCESS => res.push(ChatPacket::ConnectSuccess),
+                OP_HEARTBEAT_REPLY => res.push(ChatPacket::Popularity(cur.get_u32())),
                 OP_MESSAGE => {
-                    let str = unsafe { std::str::from_utf8_unchecked(&src[0..len]) };
-                    let json = json::parse(str).unwrap();
-                    let msg = Message::parse(json)
-                        .unwrap_or_else(|| Message::ParsingError(str.to_owned()));
-                    src.advance(len);
-                    ChatPacket::Message(msg)
+                    let decompressed: Vec<u8>;
+                    let mut data = match proto_ver {
+                        0 => &src[0..len],
+                        2 => match decompress(&src[HEADER_LENGTH..len]) {
+                            Ok(res) => {
+                                decompressed = res;
+                                &decompressed[..]
+                            }
+                            Err(_) => bail!("failed to decompress"),
+                        },
+                        _ => bail!("unsupported protocol version: {}", proto_ver),
+                    };
+                    while data.has_remaining() {
+                        let len = data.get_u32() as usize - 4;
+                        let str =
+                            unsafe { std::str::from_utf8_unchecked(&data[HEADER_LENGTH - 4..len]) };
+                        let json = json::parse(str).unwrap();
+                        let msg = Message::parse(json)
+                            .unwrap_or_else(|| Message::ParsingError(str.to_owned()));
+                        res.push(ChatPacket::Message(msg));
+                        data.advance(len);
+                    }
                 }
-                _ => {
-                    // Unexpected operation, skip this packet
-                    src.advance(len);
-                    return Ok(None);
-                }
-            }))
+                _ => (),
+            }
+            src.advance(len);
+            Ok(if res.is_empty() { None } else { Some(res) })
         }
     }
 }
@@ -204,13 +213,17 @@ pub mod msg {
     use std::fmt;
 
     pub enum Message {
+        /// 结束直播
         Preparing,
+        /// 开始直播
         Live,
+        /// 直播间信息变更
         RoomChange {
             title: String,
             area_name: String,
             parent_area_name: String,
         },
+        /// 弹幕
         Danmaku {
             mode: u32,
             size: u32,
@@ -221,6 +234,7 @@ pub mod msg {
             uid: u32,
             uname: String,
         },
+        /// 礼物
         SendGift {
             action: String,
             gift_name: String,
@@ -228,6 +242,7 @@ pub mod msg {
             uid: u32,
             uname: String,
         },
+        /// 礼物连击结束
         ComboEnd {
             action: String,
             gift_name: String,
@@ -235,6 +250,7 @@ pub mod msg {
             uid: u32,
             uname: String,
         },
+        /// 房管/老爷的欢迎消息
         Welcome {
             /// 房管
             is_admin: bool,
@@ -243,24 +259,26 @@ pub mod msg {
             uid: u32,
             uname: String,
         },
+        /// 舰队成员的欢迎消息
         WelcomeGuard {
             /// 舰队等级
             guard_level: GuardLevel,
             uid: u32,
             uname: String,
         },
+        /// 粉丝数更新（大概）
         RoomRealTimeMessageUpdate {
             /// 粉丝数
             fans: u32,
         },
+        /// 房间排行榜
         RoomRank {
-            /// 房间排行榜
             rank_desc: String,
             color: String,
             timestamp: u32,
         },
+        /// 进入房间效果（舰长、提督、总督)
         EntryEffect {
-            /// 进入房间效果(舰长、提督、总督)
             id: u32,
             uid: u32,
             target_id: u32,
@@ -268,15 +286,15 @@ pub mod msg {
             copy_writing: String,
             copy_color: String,
         },
+        /// 通知消息
         NoticeMessage {
-            /// 通知消息
             roomid: u32,
             real_roomid: u32,
             msg_common: String,
             msg_self: String,
         },
+        /// 类似于(就是) Youtube 的 SC
         SuperChatMessage {
-            /// 类似于(就是) Youtube 的 SC
             id: String,
             sender_uid: u32,
             // 打赏金额
@@ -284,8 +302,8 @@ pub mod msg {
             message: String,
             sender_name: String,
         },
+        /// 直播对象为vtuber时会可以选择翻译为日文显示，货币单位并不会转换
         SuperChatMessageJapanese {
-            /// 直播对象为vtuber时会可以选择翻译为日文显示，货币单位并不会转换
             id: String,
             sender_uid: String,
             // 打赏金额
@@ -296,8 +314,11 @@ pub mod msg {
             message_jpn: String,
             sender_name: String,
         },
+        /// 热门直播间通知
         HotRoomNotify,
+        /// 未实现解析的消息
         Raw(json::JsonValue),
+        /// 解析错误，指示可能的 API 变更
         ParsingError(String),
     }
 
@@ -388,14 +409,12 @@ pub mod msg {
                         copy_color: data["copy_color"].take_string()?,
                     }
                 }
-                "NOTICE_MSG" => {
-                    NoticeMessage {
-                        roomid: json["roomid"].as_u32()?,
-                        real_roomid: json["real_roomid"].as_u32()?,
-                        msg_common: json["msg_common"].take_string()?,
-                        msg_self: json["msg_self"].take_string()?,
-                    }
-                }
+                "NOTICE_MSG" => NoticeMessage {
+                    roomid: json["roomid"].as_u32()?,
+                    real_roomid: json["real_roomid"].as_u32()?,
+                    msg_common: json["msg_common"].take_string()?,
+                    msg_self: json["msg_self"].take_string()?,
+                },
                 "ROOM_REAL_TIME_MESSAGE_UPDATE" => {
                     let data = &mut json["data"];
                     RoomRealTimeMessageUpdate {

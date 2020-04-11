@@ -80,36 +80,29 @@ async fn handle_packet(pk: ChatPacket) {
             RoomRealTimeMessageUpdate { fans } => {
                 println!("[粉丝数] {}", fans);
             }
-            RoomRank { rank_desc, color, timestamp, } => {
+            RoomRank {
+                rank_desc,
+                color,
+                timestamp,
+            } => {
                 println!("[房间排行榜/{}][{}] {}", color, timestamp, rank_desc);
             }
-            NoticeMessage {
-                roomid,
-                real_roomid,
-                msg_common,
-                msg_self,
-            } => {
-                println!("[通知消息] {}", msg_common)
-            }
+            NoticeMessage { msg_common, .. } => println!("[通知消息] {}", msg_common),
             SuperChatMessage {
-                id,
-                sender_uid,
                 price,
                 message,
-                sender_name
-            } => {
-                println!("[SC] {} 置顶了消息 {} ({}元)", sender_name, message, price)
-            }
+                sender_name,
+                ..
+            } => println!("[SC] {} 置顶了消息 {} ({}元)", sender_name, message, price),
             SuperChatMessageJapanese {
-                id,
-                sender_uid,
                 price,
-                message,
                 message_jpn,
-                sender_name
-            } => {
-                println!("[SC] {} がメッセージをピン留めしました： {} ({}RMB)", sender_name, message_jpn, price)
-            }
+                sender_name,
+                ..
+            } => println!(
+                "[SC] {} がメッセージをピン留めしました： {} ({}RMB)",
+                sender_name, message_jpn, price
+            ),
             HotRoomNotify => println!("[热门直播间]"),
             Raw(json) => println!("{}", json.to_string()),
             ParsingError(str) => panic!("failed to parse json: {}", str),

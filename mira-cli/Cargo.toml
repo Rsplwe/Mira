@@ -6,4 +6,4 @@ edition = "2018"
 
 [dependencies]
 mira-core = { path = "../mira-core" }
-tokio = { version = "0.2", features = ["macros", "tcp", "dns", "stream", "time", "io-util"] }
+tokio = { version = "0.2", features = ["macros"] }
